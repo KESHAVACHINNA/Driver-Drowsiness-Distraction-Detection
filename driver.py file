@@ -1,0 +1,494 @@
+import cv2
+import os
+import numpy as np
+import mediapipe as mp
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import *
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
+import dlib
+from scipy.spatial import distance
+from collections import deque
+import pygame
+import threading
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+class FeatureExtractor:
+    """Extract facial landmarks and calculate drowsiness/distraction features"""
+    
+    def __init__(self):
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        
+        self.LEFT_EYE_INDICES = [33, 160, 158, 133, 159, 145]  # Horizontal: 33-133, Verticals: 160-144 (adjusted to match standard), but corrected order
+        self.RIGHT_EYE_INDICES = [362, 385, 387, 263, 386, 388]  # Horizontal: 362-263, Verticals: 385-373 (corrected)
+        self.MOUTH_INDICES = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291]  # Standard outer mouth points for better MAR
+        
+    def calculate_ear(self, eye_landmarks):
+        """Calculate Eye Aspect Ratio (EAR)"""
+        # Vertical eye landmarks
+        A = distance.euclidean(eye_landmarks[1], eye_landmarks[5])
+        B = distance.euclidean(eye_landmarks[2], eye_landmarks[4])
+        # Horizontal eye landmark
+        C = distance.euclidean(eye_landmarks[0], eye_landmarks[3])
+        
+        ear = (A + B) / (2.0 * C)
+        return ear
+    
+    def calculate_mar(self, mouth_landmarks):
+        """Calculate Mouth Aspect Ratio (MAR) for yawning detection"""
+        # Vertical distances (inner mouth)
+        A = distance.euclidean(mouth_landmarks[2], mouth_landmarks[8])
+        B = distance.euclidean(mouth_landmarks[3], mouth_landmarks[7])
+        C = distance.euclidean(mouth_landmarks[4], mouth_landmarks[6])
+        
+        # Horizontal distance
+        D = distance.euclidean(mouth_landmarks[0], mouth_landmarks[5])
+        
+        mar = (A + B + C) / (3.0 * D)
+        return mar
+    
+    def extract_features(self, frame):
+        """Extract facial landmarks and calculate EAR, MAR"""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb_frame)
+        
+        if results.multi_face_landmarks:
+            face_landmarks = results.multi_face_landmarks[0]
+            landmarks = np.array([(lm.x, lm.y) for lm in face_landmarks.landmark])
+            
+            # Extract eye landmarks (using all 6 for EAR)
+            left_eye = landmarks[self.LEFT_EYE_INDICES]
+            right_eye = landmarks[self.RIGHT_EYE_INDICES]
+            
+            # Extract mouth landmarks
+            mouth = landmarks[self.MOUTH_INDICES]
+            
+            # Calculate ratios
+            left_ear = self.calculate_ear(left_eye)
+            right_ear = self.calculate_ear(right_eye)
+            avg_ear = (left_ear + right_ear) / 2.0
+            
+            mar = self.calculate_mar(mouth)
+            
+
+            nose_tip = landmarks[1]
+            nose_bridge = landmarks[168]
+            head_tilt = abs(nose_tip[0] - nose_bridge[0])
+            
+            return {
+                'ear': avg_ear,
+                'mar': mar,
+                'head_tilt': head_tilt,
+                'landmarks': landmarks,
+                'face_detected': True
+            }
+        
+        return {
+            'ear': 0.0,
+            'mar': 0.0,
+            'head_tilt': 0.0,
+            'landmarks': None,
+            'face_detected': False
+        }
+
+class CNNLSTMModel:
+    """CNN + LSTM model for drowsiness and distraction detection"""
+    
+    def __init__(self, sequence_length=30, img_size=(64, 64)):
+        self.sequence_length = sequence_length
+        self.img_size = img_size
+        self.model = None
+        
+    def build_model(self):
+        """Build CNN + LSTM architecture"""
+        image_input = Input(shape=(self.sequence_length, *self.img_size, 3), name='image_input')
+        feature_input = Input(shape=(self.sequence_length, 3), name='feature_input')  # EAR, MAR, head_tilt
+        
+        cnn_model = tf.keras.Sequential([
+            Conv2D(32, (3, 3), activation='relu'),
+            MaxPooling2D((2, 2)),
+            Conv2D(64, (3, 3), activation='relu'),
+            MaxPooling2D((2, 2)),
+            Conv2D(128, (3, 3), activation='relu'),
+            MaxPooling2D((2, 2)),
+            GlobalAveragePooling2D(),
+            Dense(128, activation='relu'),
+            Dropout(0.3)
+        ])
+        
+        cnn_features = TimeDistributed(cnn_model)(image_input)
+        
+        combined_features = concatenate([cnn_features, feature_input])
+        
+        lstm_out = LSTM(128, return_sequences=True, dropout=0.3)(combined_features)
+        lstm_out = LSTM(64, dropout=0.3)(lstm_out)
+        
+        dense1 = Dense(64, activation='relu')(lstm_out)
+        dropout1 = Dropout(0.4)(dense1)
+        dense2 = Dense(32, activation='relu')(dropout1)
+        dropout2 = Dropout(0.3)(dense2)
+        
+        drowsiness_output = Dense(1, activation='sigmoid', name='drowsiness')(dropout2)
+        distraction_output = Dense(10, activation='softmax', name='distraction')(dropout2)  # 10 classes for StateFarm
+        
+        self.model = Model(
+            inputs=[image_input, feature_input],
+            outputs=[drowsiness_output, distraction_output]
+        )
+        
+        self.model.compile(
+            optimizer=Adam(learning_rate=0.001),
+            loss={
+                'drowsiness': 'binary_crossentropy',
+                'distraction': 'categorical_crossentropy'
+            },
+            metrics={
+                'drowsiness': ['accuracy'],
+                'distraction': ['accuracy']
+            }
+        )
+        
+        return self.model
+    
+    def train(self, train_data, val_data, epochs=50):
+        """Train the model"""
+        callbacks = [
+            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-7),
+            EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+        ]
+        
+        history = self.model.fit(
+            train_data,
+            validation_data=val_data,
+            epochs=epochs,
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        return history
+
+class AlertSystem:
+    """Audio and visual alert system"""
+    
+    def __init__(self):
+        pygame.mixer.init()
+        self.drowsiness_sound = self._generate_beep(frequency=800, duration=0.5)
+        self.distraction_sound = self._generate_beep(frequency=600, duration=0.3)
+        
+    def _generate_beep(self, frequency=440, duration=1.0, sample_rate=44100):
+        """Generate a beep sound"""
+        frames = int(duration * sample_rate)
+        arr = np.zeros((frames, 2))
+        
+        for i in range(frames):
+            wave = 0.3 * np.sin(frequency * 2 * np.pi * i / sample_rate)
+            arr[i] = [wave, wave]
+        
+        arr = (arr * 32767).astype(np.int16)
+        sound = pygame.sndarray.make_sound(arr)
+        return sound
+    
+    def play_drowsiness_alert(self):
+        """Play drowsiness alert sound"""
+        self.drowsiness_sound.play()
+    
+    def play_distraction_alert(self):
+        """Play distraction alert sound"""
+        self.distraction_sound.play()
+    
+    def draw_alert(self, frame, alert_type, confidence):
+        """Draw visual alert on frame"""
+        h, w = frame.shape[:2]
+        
+        if alert_type == 'drowsiness':
+            color = (0, 0, 255)  # Red
+            text = f"DROWSINESS ALERT! ({confidence:.3f})"
+            cv2.rectangle(frame, (10, 10), (w-10, 80), color, 2)
+            cv2.putText(frame, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+            
+        elif alert_type == 'distraction':
+            color = (0, 165, 255)  # Orange
+            text = f"DISTRACTION ALERT! ({confidence:.3f})"
+            cv2.rectangle(frame, (10, 90), (w-10, 160), color, 2)
+            cv2.putText(frame, text, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+
+class RealTimeDetector:
+    """Real-time driver monitoring system"""
+    
+    def __init__(self, model_path=None):
+        self.feature_extractor = FeatureExtractor()
+        self.alert_system = AlertSystem()
+        
+        # Load trained model if available
+        if model_path and os.path.exists(model_path):
+            self.model = tf.keras.models.load_model(model_path)
+        else:
+            # Build and initialize model
+            cnn_lstm = CNNLSTMModel()
+            self.model = cnn_lstm.build_model()
+            print("Model initialized. Train the model first for better performance.")
+        
+        # Buffers for sequence data
+        self.sequence_length = 30
+        self.frame_buffer = deque(maxlen=self.sequence_length)
+        self.feature_buffer = deque(maxlen=self.sequence_length)
+        
+        # Initial Thresholds (adjusted for better defaults)
+        self.EAR_THRESHOLD = 0.28  # Slightly higher to reduce false positives
+        self.MAR_THRESHOLD = 0.65  # Slightly higher
+        self.DROWSINESS_THRESHOLD = 0.7
+        self.DISTRACTION_THRESHOLD = 0.6
+        
+        # Counters for stability
+        self.drowsiness_counter = 0
+        self.distraction_counter = 0
+        
+        # Calibration buffers
+        self.ear_baseline = []
+        self.mar_baseline = []
+    
+    def calibrate(self, cap, calibration_frames=60):
+        """Calibrate thresholds based on neutral face (open eyes, closed mouth)"""
+        print("Calibrating... Keep eyes open and mouth closed for ~2 seconds.")
+        for _ in range(calibration_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            features = self.feature_extractor.extract_features(frame)
+            if features['face_detected']:
+                self.ear_baseline.append(features['ear'])
+                self.mar_baseline.append(features['mar'])
+            time.sleep(0.033)  # ~30 FPS
+        
+        if len(self.ear_baseline) > 0:
+            mean_ear = np.mean(self.ear_baseline)
+            std_ear = np.std(self.ear_baseline)
+            self.EAR_THRESHOLD = mean_ear - 2 * std_ear  # Drowsy if below baseline - 2std
+            print(f"Calibrated EAR Threshold: {self.EAR_THRESHOLD:.3f}")
+        
+        if len(self.mar_baseline) > 0:
+            mean_mar = np.mean(self.mar_baseline)
+            std_mar = np.std(self.mar_baseline)
+            self.MAR_THRESHOLD = mean_mar + 3 * std_mar  # Yawn if above baseline + 3std
+            print(f"Calibrated MAR Threshold: {self.MAR_THRESHOLD:.3f}")
+    
+    def classical_drowsiness_detection(self, features):
+        """Classical drowsiness detection using EAR and MAR"""
+        ear = features['ear']
+        mar = features['mar']
+        
+        is_drowsy = False
+        
+        # Eye closure detection (ensure < threshold for closed)
+        if ear < self.EAR_THRESHOLD:
+            self.drowsiness_counter += 1
+        else:
+            self.drowsiness_counter = 0
+        
+        # Yawning detection
+        yawning = mar > self.MAR_THRESHOLD
+        
+        # Trigger alert if eyes closed for multiple frames or yawning
+        if self.drowsiness_counter >= 5 or yawning:
+            is_drowsy = True
+            
+        return is_drowsy, yawning
+    
+    def preprocess_frame(self, frame):
+        """Preprocess frame for model input"""
+        # Resize and normalize
+        processed = cv2.resize(frame, (64, 64))
+        processed = processed.astype(np.float32) / 255.0
+        return processed
+    
+    def predict_state(self):
+        """Predict drowsiness and distraction using deep learning model"""
+        if len(self.frame_buffer) < self.sequence_length:
+            return None, None
+        
+        # Prepare input data
+        image_sequence = np.array(list(self.frame_buffer))[np.newaxis, ...]
+        feature_sequence = np.array(list(self.feature_buffer))[np.newaxis, ...]
+        
+        # Make prediction
+        drowsiness_pred, distraction_pred = self.model.predict(
+            [image_sequence, feature_sequence], verbose=0
+        )
+        
+        return drowsiness_pred[0][0], np.max(distraction_pred[0])
+    
+    def run_detection(self, source=0):
+        """Run real-time detection"""
+        cap = cv2.VideoCapture(source)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        # Calibrate first
+        self.calibrate(cap)
+        
+        print("Starting driver monitoring system...")
+        print("Press 'q' to quit")
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Extract features
+            features = self.feature_extractor.extract_features(frame)
+            
+            if features['face_detected']:
+                # Classical detection
+                is_drowsy_classical, yawning = self.classical_drowsiness_detection(features)
+                
+                # Add to buffers for deep learning
+                processed_frame = self.preprocess_frame(frame)
+                self.frame_buffer.append(processed_frame)
+                
+                feature_vector = [features['ear'], features['mar'], features['head_tilt']]
+                self.feature_buffer.append(feature_vector)
+                
+                # Deep learning prediction
+                drowsiness_prob, distraction_prob = self.predict_state()
+                
+                # Display information
+                cv2.putText(frame, f"EAR: {features['ear']:.3f}", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(frame, f"MAR: {features['mar']:.3f}", (10, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                
+                if yawning:
+                    cv2.putText(frame, "YAWNING DETECTED", (10, 90), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
+                # Alert logic
+                alert_triggered = False
+                
+                # Classical drowsiness alert
+                if is_drowsy_classical:
+                    self.alert_system.draw_alert(frame, 'drowsiness', features['ear'])
+                    if not alert_triggered:
+                        self.alert_system.play_drowsiness_alert()
+                        alert_triggered = True
+                
+                # Deep learning predictions
+                if drowsiness_prob and drowsiness_prob > self.DROWSINESS_THRESHOLD:
+                    self.alert_system.draw_alert(frame, 'drowsiness', drowsiness_prob)
+                    if not alert_triggered:
+                        self.alert_system.play_drowsiness_alert()
+                        alert_triggered = True
+                        
+                if distraction_prob and distraction_prob > self.DISTRACTION_THRESHOLD:
+                    self.alert_system.draw_alert(frame, 'distraction', distraction_prob)
+                    if not alert_triggered:
+                        self.alert_system.play_distraction_alert()
+                
+                # Display predictions
+                if drowsiness_prob:
+                    cv2.putText(frame, f"Drowsiness: {drowsiness_prob:.3f}", (10, 120), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                if distraction_prob:
+                    cv2.putText(frame, f"Distraction: {distraction_prob:.3f}", (10, 150), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                
+                # Draw facial landmarks
+                if features['landmarks'] is not None:
+                    for landmark in features['landmarks']:
+                        x = int(landmark[0] * frame.shape[1])
+                        y = int(landmark[1] * frame.shape[0])
+                        cv2.circle(frame, (x, y), 1, (0, 255, 0), -1)
+            
+            else:
+                cv2.putText(frame, "NO FACE DETECTED", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            
+            cv2.imshow('Driver Monitoring System', frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        
+        cap.release()
+        cv2.destroyAllWindows()
+
+def main():
+    """Main function to run the detection system"""
+    import os
+    
+    # Initialize detector
+    detector = RealTimeDetector(model_path='driver_model.h5')
+    
+    print("Driver Drowsiness & Distraction Detection System")
+    print("=" * 50)
+    print("Features:")
+    print("- Real-time face and landmark detection")
+    print("- Eye Aspect Ratio (EAR) calculation")
+    print("- Mouth Aspect Ratio (MAR) calculation")
+    print("- CNN + LSTM deep learning model")
+    print("- Audio and visual alerts")
+    print("- Classical and ML-based detection")
+    print("- Auto-calibration for personalized thresholds")
+    print("=" * 50)
+    print("\nINSTRUCTIONS:")
+    print("1. Look straight at the camera with normal expression for calibration")
+    print("2. Keep your face well-lit and centered")
+    print("3. Calibration will take ~2 seconds")
+    print("4. After calibration, the system will monitor for drowsiness")
+    print("5. Press 'q' to quit")
+    print("=" * 50)
+    
+    try:
+        # Run detection (use 0 for webcam, or path to video file)
+        detector.run_detection(source=0)
+    except KeyboardInterrupt:
+        print("\nDetection stopped by user")
+    except Exception as e:
+        print(f"Error: {e}")
+
+# Training data preparation functions
+def prepare_datasets():
+    """Prepare NTHU and StateFarm datasets for training"""
+    # This is a placeholder for dataset preparation
+    # You would implement the actual data loading and preprocessing here
+    
+    print("Dataset preparation functions:")
+    print("1. Load NTHU Driver Drowsiness Dataset")
+    print("2. Load StateFarm Distracted Driver Dataset")
+    print("3. Extract features and create sequences")
+    print("4. Create training/validation splits")
+    print("5. Data augmentation")
+    
+    # Example structure:
+    # - Load images and labels
+    # - Extract facial features for each frame
+    # - Create temporal sequences
+    # - Split into train/val/test
+    # - Return data generators
+    
+    pass
+
+def train_model():
+    """Train the CNN + LSTM model"""
+    # This is a placeholder for model training
+    # You would implement the actual training loop here
+    
+    print("Model training pipeline:")
+    print("1. Prepare datasets")
+    print("2. Create data generators")
+    print("3. Build CNN + LSTM model")
+    print("4. Train with callbacks")
+    print("5. Evaluate performance")
+    print("6. Save trained model")
+    
+    pass
+
+if __name__ == "__main__":
+    main()
